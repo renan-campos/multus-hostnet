@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: multus-hostnet
+spec:
+  selector:
+    matchLabels:
+      app: multus-hostnet
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: multus-hostnet
+      annotations:
+        k8s.v1.cni.cncf.io/networks: test-net
+    spec:
+      serviceAccount: multus-hostnet
+      containers:
+      - name: job-controller
+        image: quay.io/rcampos/multus-hostnet:latest
+        command:
+        - /bin/controller
+      priorityClassName: system-node-critical
