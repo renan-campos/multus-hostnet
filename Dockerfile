@@ -11,7 +11,7 @@ COPY go.sum go.sum
 RUN go mod download
 
 # Copy the go source
-COPY src/ src/
+COPY cmd/ cmd/
 COPY bin/ bin/
 COPY Makefile Makefile
 
