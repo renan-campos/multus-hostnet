@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"time"
 
 	"bytes"
 	"text/template"
@@ -21,6 +22,7 @@ import (
 	batch "k8s.io/api/batch/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -35,8 +37,9 @@ var (
 )
 
 const (
-	multusAnnotation   = "k8s.v1.cni.cncf.io/networks"
-	networksAnnotation = "k8s.v1.cni.cncf.io/networks-status"
+	multusAnnotation    = "k8s.v1.cni.cncf.io/networks"
+	networksAnnotation  = "k8s.v1.cni.cncf.io/networks-status"
+	migrationAnnotation = "multus-migration"
 )
 
 type selfData struct {
@@ -63,13 +66,19 @@ func main() {
 	self := findMyself(k8sClient)
 
 	fmt.Println("Running setup job")
-	runSetupJob(k8sClient, self)
+	err = runSetupJob(k8sClient, self)
+	if err != nil {
+		panic(err.Error())
+	}
 
-	fmt.Println("Waiting for SIGTERM signal")
 	<-signalChan
-
 	fmt.Println("Running teardown job")
-	runTeardownJob(k8sClient, self)
+	migratedInterface, err := getMigratedInterfaceName(k8sClient, self)
+	if err != nil {
+		panic(err.Error())
+	}
+	fmt.Printf("Removing multus interface %s", migratedInterface)
+	runTeardownJob(k8sClient, self, migratedInterface)
 }
 
 func findMyself(clientset *kubernetes.Clientset) selfData {
@@ -119,6 +128,18 @@ func findMyself(clientset *kubernetes.Clientset) selfData {
 	panic(errors.New("Could not find myself... next time try yoga"))
 }
 
+func getMigratedInterfaceName(clientset *kubernetes.Clientset, self selfData) (string, error) {
+	pod, err := clientset.CoreV1().Pods(self.Namespace).Get(context.TODO(), self.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get pod")
+	}
+	iface, found := pod.ObjectMeta.Annotations[migrationAnnotation]
+	if !found {
+		return "", errors.Wrap(err, "failed to get multus annotation")
+	}
+	return iface, nil
+}
+
 func setupK8sClient() (*kubernetes.Clientset, error) {
 	// creates the in-cluster config
 	config, err := rest.InClusterConfig()
@@ -135,6 +156,7 @@ type templateParam struct {
 	HolderIP       string
 	MultusIface    string
 	ControllerName string
+	MigratedIface  string
 }
 
 func templateToJob(name, templateData string, p templateParam) (*batch.Job, error) {
@@ -179,7 +201,28 @@ func runReplaceableJob(ctx context.Context, clientset kubernetes.Interface, job 
 	return err
 }
 
-func runSetupJob(clientset *kubernetes.Clientset, self selfData) {
+func WaitForJobCompletion(ctx context.Context, clientset kubernetes.Interface, job *batch.Job, timeout time.Duration) error {
+	return wait.Poll(5*time.Second, timeout, func() (bool, error) {
+		job, err := clientset.BatchV1().Jobs(job.Namespace).Get(ctx, job.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("failed to detect job %s. %+v", job.Name, err)
+		}
+
+		// if the job is still running, allow it to continue to completion
+		if job.Status.Active > 0 {
+			return false, nil
+		}
+		if job.Status.Failed > 0 {
+			return false, fmt.Errorf("job %s failed", job.Name)
+		}
+		if job.Status.Succeeded > 0 {
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+func runSetupJob(clientset *kubernetes.Clientset, self selfData) error {
 	pJob, err := templateToJob("setup-job", setupJobTemplate, templateParam{
 		NodeName:       self.NodeName,
 		Namespace:      self.Namespace,
@@ -188,22 +231,29 @@ func runSetupJob(clientset *kubernetes.Clientset, self selfData) {
 		ControllerName: self.Name,
 	})
 	if err != nil {
-		panic(err.Error())
+		return errors.Wrap(err, "failed to create job template")
 	}
 
 	err = runReplaceableJob(context.TODO(), clientset, pJob)
 	if err != nil {
-		panic(err.Error())
+		return errors.Wrap(err, "failed to run job")
 	}
+
+	err = WaitForJobCompletion(context.TODO(), clientset, pJob, time.Minute)
+	if err != nil {
+		return errors.Wrap(err, "failed to complete job")
+	}
+	return nil
 }
 
-func runTeardownJob(clientset *kubernetes.Clientset, self selfData) {
+func runTeardownJob(clientset *kubernetes.Clientset, self selfData, migratedInterface string) {
 	pJob, err := templateToJob("teardown-job", teardownJobTemplate, templateParam{
 		NodeName:       self.NodeName,
 		Namespace:      self.Namespace,
 		HolderIP:       self.ControllerIP,
 		MultusIface:    self.MultusInterface,
 		ControllerName: self.Name,
+		MigratedIface:  migratedInterface,
 	})
 	if err != nil {
 		panic(err.Error())

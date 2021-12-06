@@ -15,6 +15,9 @@ spec:
         image: quay.io/rcampos/multus-hostnet:latest
         command:
           - /bin/teardown-job
+        env:
+          - name: MIGRATED_IFACE
+            value: {{ .MigratedIface }}
         securityContext:
           privileged: true
           capabilities:
