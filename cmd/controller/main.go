@@ -63,7 +63,16 @@ func main() {
 	}
 
 	fmt.Println("Finding myself")
-	self := findMyself(k8sClient)
+	var self selfData
+	// Sometimes it takes time to find yourself d00d.
+	wait.Poll(time.Second, 20*time.Second, func() (bool, error) {
+		var err error
+		self, err = findMyself(k8sClient)
+		if err != nil {
+			return false, nil
+		}
+		return true, nil
+	})
 
 	fmt.Println("Running setup job")
 	err = runSetupJob(k8sClient, self)
@@ -81,23 +90,23 @@ func main() {
 	runTeardownJob(k8sClient, self, migratedInterface)
 }
 
-func findMyself(clientset *kubernetes.Clientset) selfData {
+func findMyself(clientset *kubernetes.Clientset) (selfData, error) {
 	// Fetching the pods with the appropriate daemonset label
 	pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{
 		LabelSelector: "app=multus-hostnet",
 	})
 	if err != nil {
-		panic(err.Error())
+		return selfData{}, errors.Wrap(err, "failed to get pod")
 	}
 
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		panic(err.Error())
+		return selfData{}, errors.Wrap(err, "failed to get network interfaces")
 	}
 	for _, pod := range pods.Items {
 		_, err := findInterface(interfaces, pod.Status.PodIP)
 		if err != nil && err != InterfaceNotFound {
-			panic(err.Error())
+			return selfData{}, errors.Wrap(err, "failed to look for pod network interface")
 		}
 		if err == InterfaceNotFound {
 			continue
@@ -105,15 +114,15 @@ func findMyself(clientset *kubernetes.Clientset) selfData {
 
 			multusNetworkName, found := pod.ObjectMeta.Annotations[multusAnnotation]
 			if !found {
-				panic(errors.New("multus annotation not found"))
+				return selfData{}, errors.New("multus annotation not found")
 			}
 			multusConf, err := getMultusConfs(pod)
 			if err != nil {
-				panic(err.Error())
+				return selfData{}, errors.Wrap(err, "failed to get multus configuration")
 			}
 			multusIfaceName, err := findMultusInterfaceName(multusConf, multusNetworkName, pod.ObjectMeta.Namespace)
 			if err != nil {
-				panic(err.Error())
+				return selfData{}, errors.Wrap(err, "failed to get multus interface name")
 			}
 
 			return selfData{
@@ -122,10 +131,10 @@ func findMyself(clientset *kubernetes.Clientset) selfData {
 				NodeName:        pod.Spec.NodeName,
 				ControllerIP:    pod.Status.PodIP,
 				MultusInterface: multusIfaceName,
-			}
+			}, nil
 		}
 	}
-	panic(errors.New("Could not find myself... next time try yoga"))
+	return selfData{}, errors.New("Could not find myself... next time try yoga")
 }
 
 func getMigratedInterfaceName(clientset *kubernetes.Clientset, self selfData) (string, error) {
@@ -195,6 +204,17 @@ func runReplaceableJob(ctx context.Context, clientset kubernetes.Interface, job 
 		if err != nil {
 			return fmt.Errorf("failed to remove job %s. %+v", job.Name, err)
 		}
+		// Wait for delete to complete before continuing
+		err = wait.Poll(time.Second, 20*time.Second, func() (bool, error) {
+			_, err := clientset.BatchV1().Jobs(job.Namespace).Get(ctx, job.Name, metav1.GetOptions{})
+			if err != nil && !k8sErrors.IsNotFound(err) {
+				return false, err
+			} else if err == nil {
+				// Job resource hasn't been deleted yet.
+				return false, nil
+			}
+			return true, nil
+		})
 	}
 
 	_, err = clientset.BatchV1().Jobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
